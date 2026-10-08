@@ -579,10 +579,30 @@ void setup() {
 
   tft.init();
   tft.setRotation(1);
-  tft.fillScreen(TFT_WHITE);
+  tft.invertDisplay(PANEL_INVERTED);
+  tft.fillScreen(UI_BG);
 
-  pinMode(SPEAKER_PIN, OUTPUT);
-  noTone(SPEAKER_PIN);
+#if DISPLAY_SELF_TEST
+  {
+    // Five labeled bars. On a correctly configured panel each bar
+    // matches its label. If BLACK shows white, PANEL_INVERTED is
+    // wrong for this panel.
+    const uint16_t barColor[5] = { TFT_BLACK, TFT_RED, TFT_GREEN, TFT_BLUE, TFT_WHITE };
+    const char*    barName[5]  = { "BLACK", "RED", "GREEN", "BLUE", "WHITE" };
+    const int16_t  barW = SCR_W / 5;
+    tft.setTextDatum(MC_DATUM);
+    for (int i = 0; i < 5; i++) {
+      tft.fillRect(i * barW, 0, barW, SCR_H, barColor[i]);
+      uint16_t txt = (i == 4) ? TFT_BLACK : TFT_WHITE;
+      tft.setTextColor(txt, barColor[i]);
+      tft.drawString(barName[i], i * barW + barW / 2, SCR_H / 2, 2);
+    }
+    delay(2000);
+    tft.fillScreen(UI_BG);
+  }
+#endif
+
+  buzzerInit();
 
   rd.begin(Serial2);
   rd.initMultiTarget();
@@ -593,8 +613,8 @@ void setup() {
     uint32_t elapsed = millis() - startupStart;
     bool flash = (elapsed / 120) % 2 == 0;
 
-    if (flash) drawDiagonalStripes(TFT_WHITE, TFT_RED);
-    else tft.fillScreen(TFT_WHITE);
+    if (flash) drawDiagonalStripes(UI_BG, TFT_RED);
+    else tft.fillScreen(UI_BG);
 
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_RED);
@@ -603,14 +623,14 @@ void setup() {
 
     if (!audioTestDone && elapsed > 200) {
       int freq = 600 + (elapsed - 200) / 2;
-      tone(SPEAKER_PIN, freq);
+      buzzerTone(freq, 100);
       audioTestDone = true;
     }
     delay(40);
   }
 
-  noTone(SPEAKER_PIN);
-  tft.fillScreen(TFT_WHITE);
+  buzzerOff();
+  tft.fillScreen(UI_BG);
 
   Serial.println("RD-03D collision alert ready");
   Serial.println("Narrow field filter active: +/-20 deg azimuth");
@@ -630,7 +650,6 @@ void loop() {
 
   rd.poll();
 
-  const uint32_t FRAME_TIMEOUT_MS = 600;
   bool radarAlive = (millis() - rd.getLastFrameMs()) < FRAME_TIMEOUT_MS;
 
   AlertLevel currentLevel = NORMAL;
@@ -639,6 +658,9 @@ void loop() {
   int16_t bestSpeed = 0;
   bool hasAnyApproachingTarget = false;
   int16_t mphSpeed = 0;
+
+  uint16_t proxDist = 0;          // nearest approaching target for the proximity beeper
+  bool hasRecedingTarget = false; // any target moving away
 
   if (radarAlive) {
     for (int i = 0; i < 3; i++) {
@@ -657,6 +679,19 @@ void loop() {
         if (mphSpeed == 0 || t.dist_mm < bestDist || bestDist == 0) {
           mphSpeed = t.speed_cms;
         }
+      }
+
+      // Beeper detection, deadbanded so radar sign jitter on a
+      // stationary target stays silent. Independent of the MPH
+      // display test above and of the TTC thresholds below.
+      if (t.speed_cms <= PROX_MIN_APPROACH) {
+        // Closing: track the nearest approaching target
+        if (proxDist == 0 || t.dist_mm < proxDist) {
+          proxDist = t.dist_mm;
+        }
+      } else if (t.speed_cms >= RECEDE_MIN_SPEED) {
+        // Opening: target moving away
+        hasRecedingTarget = true;
       }
 
       if (t.dist_mm >= ALERT_DIST_MM &&
@@ -684,15 +719,30 @@ void loop() {
     currentLevel = NORMAL;
   }
 
+  static bool idleViewActive = false;
+
   if (currentLevel == NORMAL) {
     if (hasAnyApproachingTarget && mphSpeed < 0) {
+      // Force a full MPH redraw when arriving from the idle view or
+      // an alert screen, otherwise an unchanged value would skip it
+      if (idleViewActive || lastLevel != NORMAL) {
+        idleViewActive = false;
+        invalidateMPH();
+      }
       drawMPH(mphSpeed);
       lastMPHMs = millis();
-    } else if (millis() - lastMPHMs > 800) {
-      tft.fillScreen(TFT_WHITE);
+    } else if (lastMPHMs != 0 && millis() - lastMPHMs <= 800) {
+      // Hold the last MPH reading briefly (original behavior)
+    } else {
       lastMPHMs = 0;
+      if (!idleViewActive) {
+        idleViewActive = true;
+        drawIdleStatic();
+      }
+      updateIdleView();
     }
   } else {
+    idleViewActive = false;
     uint32_t flashPeriod = (currentLevel == WARNING) ? WARNING_FLASH_MS : ALERT_FLASH_MS;
     uint16_t stripeColor = TFT_RED;
 
@@ -713,30 +763,50 @@ void loop() {
       flashOn = true;
     }
     if (needsRedraw) {
-      if (!flashOn) tft.fillScreen(TFT_WHITE);
-      else drawDiagonalStripes(TFT_WHITE, stripeColor);
+      if (!flashOn) tft.fillScreen(UI_BG);
+      else drawDiagonalStripes(UI_BG, stripeColor);
     }
   }
 
+  // ---------- Audio priority ----------
+  // 1. ALERT / HIGH_SPEED_FAR klaxon (unchanged triggers, full volume)
+  // 2. Proximity beeper for approaching targets within 8 m,
+  //    volume 20% at 8 m rising linearly to 100% at 2 m
+  // 3. Rapid beep-beep-beep for receding targets
   if (currentLevel == ALERT || currentLevel == HIGH_SPEED_FAR) {
     if (lastLevel != currentLevel) alertToneStartMs = millis();
 
     if (currentLevel == HIGH_SPEED_FAR) {
       uint32_t cycle = millis() % 300;
-      if (cycle < 120) tone(SPEAKER_PIN, 800);
-      else noTone(SPEAKER_PIN);
+      if (cycle < 120) buzzerTone(800, 100);
+      else buzzerOff();
     } else {
       if (millis() - lastKlaxonStepMs >= KLAXON_STEP_MS) {
         lastKlaxonStepMs = millis();
         klaxonHigh = !klaxonHigh;
-        tone(SPEAKER_PIN, klaxonHigh ? KLAXON_HIGH_FREQ : KLAXON_LOW_FREQ);
       }
+      buzzerTone(klaxonHigh ? KLAXON_HIGH_FREQ : KLAXON_LOW_FREQ, 100);
     }
   } else {
     if (millis() - alertToneStartMs >= MIN_ALERT_TONE_MS) {
-      noTone(SPEAKER_PIN);
       klaxonHigh = false;
       lastKlaxonStepMs = millis();
+
+      if (proxDist > 0 && proxDist <= PROX_FAR_MM) {
+        // Rhythmic proximity beep, louder as the target closes
+        uint32_t cycle = millis() % PROX_BEEP_PERIOD_MS;
+        if (cycle < PROX_BEEP_ON_MS) buzzerTone(PROX_BEEP_FREQ, proximityVolume(proxDist));
+        else buzzerOff();
+      } else if (hasRecedingTarget) {
+        // Rapid beep-beep-beep for a target moving away
+        uint32_t cycle = millis() % RECEDE_CYCLE_MS;
+        uint32_t unit = RECEDE_ON_MS + RECEDE_GAP_MS;
+        bool on = (cycle < 3 * unit) && ((cycle % unit) < RECEDE_ON_MS);
+        if (on) buzzerTone(RECEDE_BEEP_FREQ, 100);
+        else buzzerOff();
+      } else {
+        buzzerOff();
+      }
     }
   }
 
