@@ -5,6 +5,20 @@
   Updated:
   Added narrow azimuth filtering so alerts and MPH display only use
   targets within a forward cone of +/-20 degrees from centerline.
+
+  Updated:
+  1. Proximity beeper: rhythmic beep for approaching targets. Volume
+     scales with distance: 20% at 8 m rising linearly to 100% at 2 m.
+     Gated by its own approach deadband (PROX_MIN_APPROACH) so radar
+     sign jitter on a stationary target does not beep. Runs in
+     addition to the existing WARNING/ALERT/HIGH_SPEED_FAR thresholds
+     and triggers, which are unchanged and take priority on the
+     speaker.
+  2. Receding targets are now distinguished from approaching ones.
+     A target moving away produces a rapid beep-beep-beep pattern.
+     Existing thresholds and triggers are unchanged.
+  3. Audio now runs through LEDC PWM so duty cycle can control
+     volume. tone()/noTone() calls were replaced with buzzer helpers.
 */
 
 #include <Arduino.h>
@@ -20,9 +34,42 @@ static const uint32_t RD03D_BAUD = 256000;
 #define TFT_BL 21
 
 // ---------- Display ----------
+// Panel inversion. Evidence so far: TFT_WHITE fills displayed black
+// on this unit and TFT_BLACK displays white, so the library setup is
+// already inverting (TFT_INVERSION_ON in User_Setup.h). 0 counters
+// that. If colors ever come out reversed after a library change, flip
+// this to 1.
+#define PANEL_INVERTED 0
+
+// Shows labeled color bars for 2 s at boot so the correct
+// PANEL_INVERTED value can be confirmed on sight: the bar labeled
+// BLACK must display black and RED must display red. Set to 0 to
+// skip once verified.
+#define DISPLAY_SELF_TEST 1
+
 TFT_eSPI tft;
 static const int16_t SCR_W = 320;
 static const int16_t SCR_H = 240;
+
+// ---------- Theme ----------
+// Single place to set the background. Black is preferred for night
+// driving so the screen does not wash out the windshield.
+static const uint16_t UI_BG = TFT_BLACK;  // screen background
+static const uint16_t UI_FG = TFT_WHITE;  // text on the background
+
+// ---------- Idle radar view ----------
+// Shown only on the black idle screen: no alert, no MPH, no startup.
+static const uint16_t PLOT_RANGE_MM    = 9000;   // forward range drawn on screen
+static const uint32_t PLOT_UPDATE_MS   = 100;    // dot refresh rate
+static const uint32_t STATUS_UPDATE_MS = 250;    // frame-age text refresh rate
+static const int      DOT_RADIUS       = 3;
+static const uint16_t COLOR_CONE       = 0x2104; // very dark grey cone outline
+static const uint16_t COLOR_DOT_IN     = TFT_GREEN;   // target inside +/-20 deg
+static const uint16_t COLOR_DOT_OUT    = 0x7BEF;      // target outside the cone
+static const uint16_t COLOR_STATUS     = 0x7BEF;      // dim grey status text
+static const uint32_t FRAME_TIMEOUT_MS = 600;    // radar considered dead past this
+static const uint32_t TRAIL_FADE_MS    = 2000;   // dot persistence, full to black
+static const uint8_t  TRAIL_MAX        = 64;     // 3 targets x 20 ticks + margin
 
 // ---------- Calibration ----------
 static const uint16_t ALERT_DIST_MM                = 4572;   // 15 ft
@@ -52,6 +99,87 @@ static const int KLAXON_LOW_FREQ  = 500;
 static const int KLAXON_HIGH_FREQ = 1000;
 static const uint32_t KLAXON_STEP_MS = 250;
 static const uint32_t MIN_ALERT_TONE_MS = 1000;
+
+// ---------- Proximity beeper (approaching targets) ----------
+static const uint16_t PROX_FAR_MM   = 8000;  // beeper engages at 8 m, 20% volume
+static const uint16_t PROX_NEAR_MM  = 2000;  // 100% volume at 2 m and closer
+static const uint8_t  PROX_VOL_FAR  = 20;    // percent
+static const uint8_t  PROX_VOL_NEAR = 100;   // percent
+static const int      PROX_BEEP_FREQ    = 1200;
+static const uint32_t PROX_BEEP_ON_MS   = 100;
+static const uint32_t PROX_BEEP_PERIOD_MS = 350; // on + off
+// Deadband so radar sign jitter on a stationary target does not beep.
+// Set below MIN_APPROACH_SPEED so a slow roll still triggers the beeper.
+static const int      PROX_MIN_APPROACH = -30;  // cm/s, about 0.7 mph
+
+// ---------- Receding beeper (targets moving away) ----------
+static const int      RECEDE_MIN_SPEED  = 200;   // cm/s away; mirrors MIN_APPROACH_SPEED
+static const int      RECEDE_BEEP_FREQ  = 2000;
+static const uint32_t RECEDE_ON_MS      = 60;
+static const uint32_t RECEDE_GAP_MS     = 60;
+static const uint32_t RECEDE_CYCLE_MS   = 760;   // 3x(on+gap) + rest
+
+// ---------- LEDC buzzer with volume control ----------
+// tone() has no volume control. The speaker is driven with LEDC PWM;
+// duty cycle sets loudness (50% duty = full volume for a square wave).
+static const int      BUZZ_LEDC_CH   = 4;   // avoid channels TFT_eSPI may use
+static const int      BUZZ_LEDC_RES  = 10;  // bits
+static const uint32_t BUZZ_DUTY_MAX  = 512; // 50% of 1023
+
+static int currentBuzzFreq = 0;
+static uint8_t currentBuzzVol = 0;
+
+static void buzzerInit() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcAttachChannel(SPEAKER_PIN, 2000, BUZZ_LEDC_RES, BUZZ_LEDC_CH);
+  ledcWrite(SPEAKER_PIN, 0);
+#else
+  ledcSetup(BUZZ_LEDC_CH, 2000, BUZZ_LEDC_RES);
+  ledcAttachPin(SPEAKER_PIN, BUZZ_LEDC_CH);
+  ledcWrite(BUZZ_LEDC_CH, 0);
+#endif
+}
+
+// volPct: 1-100. Duty is scaled from 0 up to 50% duty.
+static void buzzerTone(int freq, uint8_t volPct) {
+  if (freq <= 0 || volPct == 0) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    ledcWrite(SPEAKER_PIN, 0);
+#else
+    ledcWrite(BUZZ_LEDC_CH, 0);
+#endif
+    currentBuzzFreq = 0;
+    currentBuzzVol = 0;
+    return;
+  }
+  if (volPct > 100) volPct = 100;
+  uint32_t duty = (BUZZ_DUTY_MAX * (uint32_t)volPct) / 100;
+  if (duty == 0) duty = 1;
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  if (freq != currentBuzzFreq) ledcWriteTone(SPEAKER_PIN, freq);
+  ledcWrite(SPEAKER_PIN, duty);
+#else
+  if (freq != currentBuzzFreq) ledcWriteTone(BUZZ_LEDC_CH, freq);
+  ledcWrite(BUZZ_LEDC_CH, duty);
+#endif
+  currentBuzzFreq = freq;
+  currentBuzzVol = volPct;
+}
+
+static void buzzerOff() {
+  buzzerTone(0, 0);
+}
+
+// Linear volume map: 20% at PROX_FAR_MM to 100% at PROX_NEAR_MM.
+static uint8_t proximityVolume(uint16_t dist_mm) {
+  if (dist_mm >= PROX_FAR_MM)  return PROX_VOL_FAR;
+  if (dist_mm <= PROX_NEAR_MM) return PROX_VOL_NEAR;
+  uint32_t span   = PROX_FAR_MM - PROX_NEAR_MM;              // 6000
+  uint32_t travel = PROX_FAR_MM - dist_mm;                   // 0..6000
+  return (uint8_t)(PROX_VOL_FAR +
+         (travel * (uint32_t)(PROX_VOL_NEAR - PROX_VOL_FAR)) / span);
+}
 
 // ---------- Target struct ----------
 struct RD03DTarget {
