@@ -1,0 +1,22 @@
+# Arduino / ESP32 local build and editor artifacts
+build/
+.pio/
+.vscode/
+*.elf
+*.map
+*.o
+*.d
+*.a
+*.log
+
+# Local credentials, if introduced by future experiments
+.env
+.env.*
+!.env.example
+secrets.h
+credentials.h
+*.local
+
+# OS clutter
+.DS_Store
+Thumbs.db

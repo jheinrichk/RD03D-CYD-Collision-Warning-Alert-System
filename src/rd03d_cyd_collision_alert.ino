@@ -5,6 +5,20 @@
   Updated:
   Added narrow azimuth filtering so alerts and MPH display only use
   targets within a forward cone of +/-20 degrees from centerline.
+
+  Updated:
+  1. Proximity beeper: rhythmic beep for approaching targets. Volume
+     scales with distance: 20% at 8 m rising linearly to 100% at 2 m.
+     Gated by its own approach deadband (PROX_MIN_APPROACH) so radar
+     sign jitter on a stationary target does not beep. Runs in
+     addition to the existing WARNING/ALERT/HIGH_SPEED_FAR thresholds
+     and triggers, which are unchanged and take priority on the
+     speaker.
+  2. Receding targets are now distinguished from approaching ones.
+     A target moving away produces a rapid beep-beep-beep pattern.
+     Existing thresholds and triggers are unchanged.
+  3. Audio now runs through LEDC PWM so duty cycle can control
+     volume. tone()/noTone() calls were replaced with buzzer helpers.
 */
 
 #include <Arduino.h>
@@ -20,9 +34,42 @@ static const uint32_t RD03D_BAUD = 256000;
 #define TFT_BL 21
 
 // ---------- Display ----------
+// Panel inversion. Evidence so far: TFT_WHITE fills displayed black
+// on this unit and TFT_BLACK displays white, so the library setup is
+// already inverting (TFT_INVERSION_ON in User_Setup.h). 0 counters
+// that. If colors ever come out reversed after a library change, flip
+// this to 1.
+#define PANEL_INVERTED 0
+
+// Shows labeled color bars for 2 s at boot so the correct
+// PANEL_INVERTED value can be confirmed on sight: the bar labeled
+// BLACK must display black and RED must display red. Set to 0 to
+// skip once verified.
+#define DISPLAY_SELF_TEST 1
+
 TFT_eSPI tft;
 static const int16_t SCR_W = 320;
 static const int16_t SCR_H = 240;
+
+// ---------- Theme ----------
+// Single place to set the background. Black is preferred for night
+// driving so the screen does not wash out the windshield.
+static const uint16_t UI_BG = TFT_BLACK;  // screen background
+static const uint16_t UI_FG = TFT_WHITE;  // text on the background
+
+// ---------- Idle radar view ----------
+// Shown only on the black idle screen: no alert, no MPH, no startup.
+static const uint16_t PLOT_RANGE_MM    = 9000;   // forward range drawn on screen
+static const uint32_t PLOT_UPDATE_MS   = 100;    // dot refresh rate
+static const uint32_t STATUS_UPDATE_MS = 250;    // frame-age text refresh rate
+static const int      DOT_RADIUS       = 3;
+static const uint16_t COLOR_CONE       = 0x2104; // very dark grey cone outline
+static const uint16_t COLOR_DOT_IN     = TFT_GREEN;   // target inside +/-20 deg
+static const uint16_t COLOR_DOT_OUT    = 0x7BEF;      // target outside the cone
+static const uint16_t COLOR_STATUS     = 0x7BEF;      // dim grey status text
+static const uint32_t FRAME_TIMEOUT_MS = 600;    // radar considered dead past this
+static const uint32_t TRAIL_FADE_MS    = 2000;   // dot persistence, full to black
+static const uint8_t  TRAIL_MAX        = 64;     // 3 targets x 20 ticks + margin
 
 // ---------- Calibration ----------
 static const uint16_t ALERT_DIST_MM                = 4572;   // 15 ft
@@ -52,6 +99,87 @@ static const int KLAXON_LOW_FREQ  = 500;
 static const int KLAXON_HIGH_FREQ = 1000;
 static const uint32_t KLAXON_STEP_MS = 250;
 static const uint32_t MIN_ALERT_TONE_MS = 1000;
+
+// ---------- Proximity beeper (approaching targets) ----------
+static const uint16_t PROX_FAR_MM   = 8000;  // beeper engages at 8 m, 20% volume
+static const uint16_t PROX_NEAR_MM  = 2000;  // 100% volume at 2 m and closer
+static const uint8_t  PROX_VOL_FAR  = 20;    // percent
+static const uint8_t  PROX_VOL_NEAR = 100;   // percent
+static const int      PROX_BEEP_FREQ    = 1200;
+static const uint32_t PROX_BEEP_ON_MS   = 100;
+static const uint32_t PROX_BEEP_PERIOD_MS = 350; // on + off
+// Deadband so radar sign jitter on a stationary target does not beep.
+// Set below MIN_APPROACH_SPEED so a slow roll still triggers the beeper.
+static const int      PROX_MIN_APPROACH = -30;  // cm/s, about 0.7 mph
+
+// ---------- Receding beeper (targets moving away) ----------
+static const int      RECEDE_MIN_SPEED  = 200;   // cm/s away; mirrors MIN_APPROACH_SPEED
+static const int      RECEDE_BEEP_FREQ  = 2000;
+static const uint32_t RECEDE_ON_MS      = 60;
+static const uint32_t RECEDE_GAP_MS     = 60;
+static const uint32_t RECEDE_CYCLE_MS   = 760;   // 3x(on+gap) + rest
+
+// ---------- LEDC buzzer with volume control ----------
+// tone() has no volume control. The speaker is driven with LEDC PWM;
+// duty cycle sets loudness (50% duty = full volume for a square wave).
+static const int      BUZZ_LEDC_CH   = 4;   // avoid channels TFT_eSPI may use
+static const int      BUZZ_LEDC_RES  = 10;  // bits
+static const uint32_t BUZZ_DUTY_MAX  = 512; // 50% of 1023
+
+static int currentBuzzFreq = 0;
+static uint8_t currentBuzzVol = 0;
+
+static void buzzerInit() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  ledcAttachChannel(SPEAKER_PIN, 2000, BUZZ_LEDC_RES, BUZZ_LEDC_CH);
+  ledcWrite(SPEAKER_PIN, 0);
+#else
+  ledcSetup(BUZZ_LEDC_CH, 2000, BUZZ_LEDC_RES);
+  ledcAttachPin(SPEAKER_PIN, BUZZ_LEDC_CH);
+  ledcWrite(BUZZ_LEDC_CH, 0);
+#endif
+}
+
+// volPct: 1-100. Duty is scaled from 0 up to 50% duty.
+static void buzzerTone(int freq, uint8_t volPct) {
+  if (freq <= 0 || volPct == 0) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    ledcWrite(SPEAKER_PIN, 0);
+#else
+    ledcWrite(BUZZ_LEDC_CH, 0);
+#endif
+    currentBuzzFreq = 0;
+    currentBuzzVol = 0;
+    return;
+  }
+  if (volPct > 100) volPct = 100;
+  uint32_t duty = (BUZZ_DUTY_MAX * (uint32_t)volPct) / 100;
+  if (duty == 0) duty = 1;
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  if (freq != currentBuzzFreq) ledcWriteTone(SPEAKER_PIN, freq);
+  ledcWrite(SPEAKER_PIN, duty);
+#else
+  if (freq != currentBuzzFreq) ledcWriteTone(BUZZ_LEDC_CH, freq);
+  ledcWrite(BUZZ_LEDC_CH, duty);
+#endif
+  currentBuzzFreq = freq;
+  currentBuzzVol = volPct;
+}
+
+static void buzzerOff() {
+  buzzerTone(0, 0);
+}
+
+// Linear volume map: 20% at PROX_FAR_MM to 100% at PROX_NEAR_MM.
+static uint8_t proximityVolume(uint16_t dist_mm) {
+  if (dist_mm >= PROX_FAR_MM)  return PROX_VOL_FAR;
+  if (dist_mm <= PROX_NEAR_MM) return PROX_VOL_NEAR;
+  uint32_t span   = PROX_FAR_MM - PROX_NEAR_MM;              // 6000
+  uint32_t travel = PROX_FAR_MM - dist_mm;                   // 0..6000
+  return (uint8_t)(PROX_VOL_FAR +
+         (travel * (uint32_t)(PROX_VOL_NEAR - PROX_VOL_FAR)) / span);
+}
 
 // ---------- Target struct ----------
 struct RD03DTarget {
@@ -222,17 +350,18 @@ static void drawDiagonalStripes(uint16_t baseColor, uint16_t stripeColor) {
 }
 
 // Dynamic MPH display
-static void drawMPH(int16_t speed_cms) {
-  static float lastDrawnMPH = -1.0f;
+static float lastDrawnMPH = -1.0f;
+static void invalidateMPH() { lastDrawnMPH = -999.0f; }
 
+static void drawMPH(int16_t speed_cms) {
   float mph = -speed_cms * 0.0223694f;
   if (fabsf(mph - lastDrawnMPH) >= 0.5f) {
     int fontSize = 7 + (abs(speed_cms) / 100);
     if (fontSize > 8) fontSize = 8;
 
-    tft.fillScreen(TFT_WHITE);
+    tft.fillScreen(UI_BG);
     tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextColor(UI_FG, UI_BG);
 
     for (int dx = -1; dx <= 1; dx++) {
       for (int dy = -1; dy <= 1; dy++) {
@@ -249,6 +378,197 @@ static void drawMPH(int16_t speed_cms) {
   }
 }
 
+// ---------- Idle radar view ----------
+// Top-down plot of raw RD03D targets. Sensor sits at bottom center,
+// forward is up. Dots: green inside the +/-20 deg cone, grey outside.
+// A dim status line at the bottom edge shows ms since the last good
+// frame so a dead or disconnected sensor is obvious.
+static const int16_t PLOT_ORIGIN_X = SCR_W / 2;
+static const int16_t PLOT_ORIGIN_Y = SCR_H - 14;  // keep clear of status text
+static const int16_t PLOT_TOP_Y    = 6;
+static const int16_t PLOT_SPAN_PX  = PLOT_ORIGIN_Y - PLOT_TOP_Y;  // 220 px
+
+// ---------- Fading trails ----------
+// Phosphor-style persistence: every plotted dot stays on screen and
+// dims to black over TRAIL_FADE_MS. New dots draw at full brightness
+// on top, so target motion reads as a comet trail.
+struct TrailDot {
+  bool     active = false;
+  int16_t  x = 0;
+  int16_t  y = 0;
+  uint32_t bornMs = 0;
+  bool     inCone = false;
+};
+static TrailDot trail[TRAIL_MAX];
+static int8_t   slotTrailIdx[3] = { -1, -1, -1 };  // newest trail entry per slot
+
+// Scale an RGB565 color by num/den toward black
+static uint16_t dimColor(uint16_t c, uint32_t num, uint32_t den) {
+  uint32_t r = (c >> 11) & 0x1F;
+  uint32_t g = (c >> 5)  & 0x3F;
+  uint32_t b =  c        & 0x1F;
+  r = (r * num) / den;
+  g = (g * num) / den;
+  b = (b * num) / den;
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+static void trailReset() {
+  for (int i = 0; i < TRAIL_MAX; i++) trail[i].active = false;
+  for (int i = 0; i < 3; i++) slotTrailIdx[i] = -1;
+}
+
+// Add a dot for slot s, or refresh the timestamp if the target has
+// not moved so a stationary object stays at full brightness instead
+// of stacking duplicate entries.
+static void trailAdd(int s, int16_t x, int16_t y, bool inCone) {
+  int8_t li = slotTrailIdx[s];
+  if (li >= 0 && trail[li].active && trail[li].x == x && trail[li].y == y) {
+    trail[li].bornMs = millis();
+    trail[li].inCone = inCone;
+    return;
+  }
+  // find a free entry, else steal the oldest
+  int idx = -1;
+  uint32_t oldest = 0xFFFFFFFF;
+  int oldestIdx = 0;
+  for (int i = 0; i < TRAIL_MAX; i++) {
+    if (!trail[i].active) { idx = i; break; }
+    if (trail[i].bornMs < oldest) { oldest = trail[i].bornMs; oldestIdx = i; }
+  }
+  if (idx < 0) {
+    idx = oldestIdx;
+    tft.fillCircle(trail[idx].x, trail[idx].y, DOT_RADIUS, UI_BG);
+  }
+  trail[idx].active = true;
+  trail[idx].x = x;
+  trail[idx].y = y;
+  trail[idx].bornMs = millis();
+  trail[idx].inCone = inCone;
+  slotTrailIdx[s] = (int8_t)idx;
+}
+
+// Repaint all trail dots at their current fade level. Expired dots
+// are blacked out and freed. Painted oldest first so fresh dots sit
+// on top where trails overlap.
+static void trailPaint() {
+  uint32_t now = millis();
+
+  int order[TRAIL_MAX];
+  int n = 0;
+  for (int i = 0; i < TRAIL_MAX; i++) {
+    if (!trail[i].active) continue;
+    int j = n++;
+    while (j > 0 && trail[order[j - 1]].bornMs > trail[i].bornMs) {
+      order[j] = order[j - 1];
+      j--;
+    }
+    order[j] = i;
+  }
+
+  for (int k = 0; k < n; k++) {
+    TrailDot& d = trail[order[k]];
+    uint32_t age = now - d.bornMs;
+    if (age >= TRAIL_FADE_MS) {
+      tft.fillCircle(d.x, d.y, DOT_RADIUS, UI_BG);
+      d.active = false;
+      continue;
+    }
+    uint16_t base = d.inCone ? COLOR_DOT_IN : COLOR_DOT_OUT;
+    uint16_t c = dimColor(base, TRAIL_FADE_MS - age, TRAIL_FADE_MS);
+    tft.fillCircle(d.x, d.y, DOT_RADIUS, c);
+  }
+}
+
+static void drawIdleCone() {
+  // tan(20 deg) = 0.36397; horizontal reach at full span
+  int16_t dx = (int16_t)(0.36397f * PLOT_SPAN_PX);  // ~80 px
+  tft.drawLine(PLOT_ORIGIN_X, PLOT_ORIGIN_Y, PLOT_ORIGIN_X - dx, PLOT_TOP_Y, COLOR_CONE);
+  tft.drawLine(PLOT_ORIGIN_X, PLOT_ORIGIN_Y, PLOT_ORIGIN_X + dx, PLOT_TOP_Y, COLOR_CONE);
+}
+
+// Map target slot i to screen. Same mm-per-pixel on both axes so the
+// plot keeps true aspect. Returns false if it cannot be plotted.
+// Takes the slot index, not the struct, so the Arduino-generated
+// prototype does not reference RD03DTarget before its definition.
+static bool plotPos(int i, int16_t* px, int16_t* py) {
+  const RD03DTarget& t = rd.target(i);
+  if (!t.valid || t.y_mm <= 0) return false;
+  if (t.y_mm > (int32_t)PLOT_RANGE_MM) return false;
+
+  int32_t x = PLOT_ORIGIN_X + ((int32_t)t.x_mm * PLOT_SPAN_PX) / (int32_t)PLOT_RANGE_MM;
+  int32_t y = PLOT_ORIGIN_Y - ((int32_t)t.y_mm * PLOT_SPAN_PX) / (int32_t)PLOT_RANGE_MM;
+
+  if (x < DOT_RADIUS || x > SCR_W - 1 - DOT_RADIUS) return false;
+  if (y < PLOT_TOP_Y || y > PLOT_ORIGIN_Y) return false;
+
+  *px = (int16_t)x;
+  *py = (int16_t)y;
+  return true;
+}
+
+static void drawIdleStatus() {
+  uint32_t lastFrame = rd.getLastFrameMs();
+  char buf[28];
+  uint16_t color;
+
+  if (lastFrame == 0) {
+    color = TFT_RED;
+    snprintf(buf, sizeof(buf), "RD03D: NO DATA");
+  } else {
+    uint32_t age = millis() - lastFrame;
+    if (age >= FRAME_TIMEOUT_MS) {
+      color = TFT_RED;
+      snprintf(buf, sizeof(buf), "RD03D LOST %lums", (unsigned long)age);
+    } else {
+      color = COLOR_STATUS;
+      snprintf(buf, sizeof(buf), "RD03D %lums", (unsigned long)age);
+    }
+  }
+
+  tft.setTextDatum(BL_DATUM);
+  tft.setTextColor(color, UI_BG);
+  tft.setTextPadding(150);  // clears leftover characters when text shortens
+  tft.drawString(buf, 2, SCR_H - 1, 1);
+  tft.setTextPadding(0);
+}
+
+// Full redraw on entering the idle view
+static void drawIdleStatic() {
+  tft.fillScreen(UI_BG);
+  trailReset();
+  drawIdleCone();
+  drawIdleStatus();
+}
+
+// Incremental update while the idle view is showing
+static void updateIdleView() {
+  static uint32_t lastPlotMs = 0;
+  static uint32_t lastStatusMs = 0;
+
+  if (millis() - lastPlotMs >= PLOT_UPDATE_MS) {
+    lastPlotMs = millis();
+
+    // Register current targets as fresh trail dots
+    for (int i = 0; i < 3; i++) {
+      int16_t x, y;
+      if (!plotPos(i, &x, &y)) continue;
+      trailAdd(i, x, y, targetInNarrowField(rd.target(i)));
+    }
+
+    // Repaint every dot at its fade level; expired dots black out
+    trailPaint();
+
+    // Restore cone lines where fading or expiring dots crossed them
+    drawIdleCone();
+  }
+
+  if (millis() - lastStatusMs >= STATUS_UPDATE_MS) {
+    lastStatusMs = millis();
+    drawIdleStatus();
+  }
+}
+
 // ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
@@ -259,10 +579,30 @@ void setup() {
 
   tft.init();
   tft.setRotation(1);
-  tft.fillScreen(TFT_WHITE);
+  tft.invertDisplay(PANEL_INVERTED);
+  tft.fillScreen(UI_BG);
 
-  pinMode(SPEAKER_PIN, OUTPUT);
-  noTone(SPEAKER_PIN);
+#if DISPLAY_SELF_TEST
+  {
+    // Five labeled bars. On a correctly configured panel each bar
+    // matches its label. If BLACK shows white, PANEL_INVERTED is
+    // wrong for this panel.
+    const uint16_t barColor[5] = { TFT_BLACK, TFT_RED, TFT_GREEN, TFT_BLUE, TFT_WHITE };
+    const char*    barName[5]  = { "BLACK", "RED", "GREEN", "BLUE", "WHITE" };
+    const int16_t  barW = SCR_W / 5;
+    tft.setTextDatum(MC_DATUM);
+    for (int i = 0; i < 5; i++) {
+      tft.fillRect(i * barW, 0, barW, SCR_H, barColor[i]);
+      uint16_t txt = (i == 4) ? TFT_BLACK : TFT_WHITE;
+      tft.setTextColor(txt, barColor[i]);
+      tft.drawString(barName[i], i * barW + barW / 2, SCR_H / 2, 2);
+    }
+    delay(2000);
+    tft.fillScreen(UI_BG);
+  }
+#endif
+
+  buzzerInit();
 
   rd.begin(Serial2);
   rd.initMultiTarget();
@@ -273,8 +613,8 @@ void setup() {
     uint32_t elapsed = millis() - startupStart;
     bool flash = (elapsed / 120) % 2 == 0;
 
-    if (flash) drawDiagonalStripes(TFT_WHITE, TFT_RED);
-    else tft.fillScreen(TFT_WHITE);
+    if (flash) drawDiagonalStripes(UI_BG, TFT_RED);
+    else tft.fillScreen(UI_BG);
 
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_RED);
@@ -283,14 +623,14 @@ void setup() {
 
     if (!audioTestDone && elapsed > 200) {
       int freq = 600 + (elapsed - 200) / 2;
-      tone(SPEAKER_PIN, freq);
+      buzzerTone(freq, 100);
       audioTestDone = true;
     }
     delay(40);
   }
 
-  noTone(SPEAKER_PIN);
-  tft.fillScreen(TFT_WHITE);
+  buzzerOff();
+  tft.fillScreen(UI_BG);
 
   Serial.println("RD-03D collision alert ready");
   Serial.println("Narrow field filter active: +/-20 deg azimuth");
@@ -310,7 +650,6 @@ void loop() {
 
   rd.poll();
 
-  const uint32_t FRAME_TIMEOUT_MS = 600;
   bool radarAlive = (millis() - rd.getLastFrameMs()) < FRAME_TIMEOUT_MS;
 
   AlertLevel currentLevel = NORMAL;
@@ -319,6 +658,9 @@ void loop() {
   int16_t bestSpeed = 0;
   bool hasAnyApproachingTarget = false;
   int16_t mphSpeed = 0;
+
+  uint16_t proxDist = 0;          // nearest approaching target for the proximity beeper
+  bool hasRecedingTarget = false; // any target moving away
 
   if (radarAlive) {
     for (int i = 0; i < 3; i++) {
@@ -337,6 +679,19 @@ void loop() {
         if (mphSpeed == 0 || t.dist_mm < bestDist || bestDist == 0) {
           mphSpeed = t.speed_cms;
         }
+      }
+
+      // Beeper detection, deadbanded so radar sign jitter on a
+      // stationary target stays silent. Independent of the MPH
+      // display test above and of the TTC thresholds below.
+      if (t.speed_cms <= PROX_MIN_APPROACH) {
+        // Closing: track the nearest approaching target
+        if (proxDist == 0 || t.dist_mm < proxDist) {
+          proxDist = t.dist_mm;
+        }
+      } else if (t.speed_cms >= RECEDE_MIN_SPEED) {
+        // Opening: target moving away
+        hasRecedingTarget = true;
       }
 
       if (t.dist_mm >= ALERT_DIST_MM &&
@@ -364,15 +719,30 @@ void loop() {
     currentLevel = NORMAL;
   }
 
+  static bool idleViewActive = false;
+
   if (currentLevel == NORMAL) {
     if (hasAnyApproachingTarget && mphSpeed < 0) {
+      // Force a full MPH redraw when arriving from the idle view or
+      // an alert screen, otherwise an unchanged value would skip it
+      if (idleViewActive || lastLevel != NORMAL) {
+        idleViewActive = false;
+        invalidateMPH();
+      }
       drawMPH(mphSpeed);
       lastMPHMs = millis();
-    } else if (millis() - lastMPHMs > 800) {
-      tft.fillScreen(TFT_WHITE);
+    } else if (lastMPHMs != 0 && millis() - lastMPHMs <= 800) {
+      // Hold the last MPH reading briefly (original behavior)
+    } else {
       lastMPHMs = 0;
+      if (!idleViewActive) {
+        idleViewActive = true;
+        drawIdleStatic();
+      }
+      updateIdleView();
     }
   } else {
+    idleViewActive = false;
     uint32_t flashPeriod = (currentLevel == WARNING) ? WARNING_FLASH_MS : ALERT_FLASH_MS;
     uint16_t stripeColor = TFT_RED;
 
@@ -393,30 +763,50 @@ void loop() {
       flashOn = true;
     }
     if (needsRedraw) {
-      if (!flashOn) tft.fillScreen(TFT_WHITE);
-      else drawDiagonalStripes(TFT_WHITE, stripeColor);
+      if (!flashOn) tft.fillScreen(UI_BG);
+      else drawDiagonalStripes(UI_BG, stripeColor);
     }
   }
 
+  // ---------- Audio priority ----------
+  // 1. ALERT / HIGH_SPEED_FAR klaxon (unchanged triggers, full volume)
+  // 2. Proximity beeper for approaching targets within 8 m,
+  //    volume 20% at 8 m rising linearly to 100% at 2 m
+  // 3. Rapid beep-beep-beep for receding targets
   if (currentLevel == ALERT || currentLevel == HIGH_SPEED_FAR) {
     if (lastLevel != currentLevel) alertToneStartMs = millis();
 
     if (currentLevel == HIGH_SPEED_FAR) {
       uint32_t cycle = millis() % 300;
-      if (cycle < 120) tone(SPEAKER_PIN, 800);
-      else noTone(SPEAKER_PIN);
+      if (cycle < 120) buzzerTone(800, 100);
+      else buzzerOff();
     } else {
       if (millis() - lastKlaxonStepMs >= KLAXON_STEP_MS) {
         lastKlaxonStepMs = millis();
         klaxonHigh = !klaxonHigh;
-        tone(SPEAKER_PIN, klaxonHigh ? KLAXON_HIGH_FREQ : KLAXON_LOW_FREQ);
       }
+      buzzerTone(klaxonHigh ? KLAXON_HIGH_FREQ : KLAXON_LOW_FREQ, 100);
     }
   } else {
     if (millis() - alertToneStartMs >= MIN_ALERT_TONE_MS) {
-      noTone(SPEAKER_PIN);
       klaxonHigh = false;
       lastKlaxonStepMs = millis();
+
+      if (proxDist > 0 && proxDist <= PROX_FAR_MM) {
+        // Rhythmic proximity beep, louder as the target closes
+        uint32_t cycle = millis() % PROX_BEEP_PERIOD_MS;
+        if (cycle < PROX_BEEP_ON_MS) buzzerTone(PROX_BEEP_FREQ, proximityVolume(proxDist));
+        else buzzerOff();
+      } else if (hasRecedingTarget) {
+        // Rapid beep-beep-beep for a target moving away
+        uint32_t cycle = millis() % RECEDE_CYCLE_MS;
+        uint32_t unit = RECEDE_ON_MS + RECEDE_GAP_MS;
+        bool on = (cycle < 3 * unit) && ((cycle % unit) < RECEDE_ON_MS);
+        if (on) buzzerTone(RECEDE_BEEP_FREQ, 100);
+        else buzzerOff();
+      } else {
+        buzzerOff();
+      }
     }
   }
 
