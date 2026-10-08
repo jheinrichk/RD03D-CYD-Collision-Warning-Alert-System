@@ -350,17 +350,18 @@ static void drawDiagonalStripes(uint16_t baseColor, uint16_t stripeColor) {
 }
 
 // Dynamic MPH display
-static void drawMPH(int16_t speed_cms) {
-  static float lastDrawnMPH = -1.0f;
+static float lastDrawnMPH = -1.0f;
+static void invalidateMPH() { lastDrawnMPH = -999.0f; }
 
+static void drawMPH(int16_t speed_cms) {
   float mph = -speed_cms * 0.0223694f;
   if (fabsf(mph - lastDrawnMPH) >= 0.5f) {
     int fontSize = 7 + (abs(speed_cms) / 100);
     if (fontSize > 8) fontSize = 8;
 
-    tft.fillScreen(TFT_WHITE);
+    tft.fillScreen(UI_BG);
     tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.setTextColor(UI_FG, UI_BG);
 
     for (int dx = -1; dx <= 1; dx++) {
       for (int dy = -1; dy <= 1; dy++) {
@@ -374,6 +375,197 @@ static void drawMPH(int16_t speed_cms) {
     tft.drawString("MPH", SCR_W / 2, 190, 4);
 
     lastDrawnMPH = mph;
+  }
+}
+
+// ---------- Idle radar view ----------
+// Top-down plot of raw RD03D targets. Sensor sits at bottom center,
+// forward is up. Dots: green inside the +/-20 deg cone, grey outside.
+// A dim status line at the bottom edge shows ms since the last good
+// frame so a dead or disconnected sensor is obvious.
+static const int16_t PLOT_ORIGIN_X = SCR_W / 2;
+static const int16_t PLOT_ORIGIN_Y = SCR_H - 14;  // keep clear of status text
+static const int16_t PLOT_TOP_Y    = 6;
+static const int16_t PLOT_SPAN_PX  = PLOT_ORIGIN_Y - PLOT_TOP_Y;  // 220 px
+
+// ---------- Fading trails ----------
+// Phosphor-style persistence: every plotted dot stays on screen and
+// dims to black over TRAIL_FADE_MS. New dots draw at full brightness
+// on top, so target motion reads as a comet trail.
+struct TrailDot {
+  bool     active = false;
+  int16_t  x = 0;
+  int16_t  y = 0;
+  uint32_t bornMs = 0;
+  bool     inCone = false;
+};
+static TrailDot trail[TRAIL_MAX];
+static int8_t   slotTrailIdx[3] = { -1, -1, -1 };  // newest trail entry per slot
+
+// Scale an RGB565 color by num/den toward black
+static uint16_t dimColor(uint16_t c, uint32_t num, uint32_t den) {
+  uint32_t r = (c >> 11) & 0x1F;
+  uint32_t g = (c >> 5)  & 0x3F;
+  uint32_t b =  c        & 0x1F;
+  r = (r * num) / den;
+  g = (g * num) / den;
+  b = (b * num) / den;
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+static void trailReset() {
+  for (int i = 0; i < TRAIL_MAX; i++) trail[i].active = false;
+  for (int i = 0; i < 3; i++) slotTrailIdx[i] = -1;
+}
+
+// Add a dot for slot s, or refresh the timestamp if the target has
+// not moved so a stationary object stays at full brightness instead
+// of stacking duplicate entries.
+static void trailAdd(int s, int16_t x, int16_t y, bool inCone) {
+  int8_t li = slotTrailIdx[s];
+  if (li >= 0 && trail[li].active && trail[li].x == x && trail[li].y == y) {
+    trail[li].bornMs = millis();
+    trail[li].inCone = inCone;
+    return;
+  }
+  // find a free entry, else steal the oldest
+  int idx = -1;
+  uint32_t oldest = 0xFFFFFFFF;
+  int oldestIdx = 0;
+  for (int i = 0; i < TRAIL_MAX; i++) {
+    if (!trail[i].active) { idx = i; break; }
+    if (trail[i].bornMs < oldest) { oldest = trail[i].bornMs; oldestIdx = i; }
+  }
+  if (idx < 0) {
+    idx = oldestIdx;
+    tft.fillCircle(trail[idx].x, trail[idx].y, DOT_RADIUS, UI_BG);
+  }
+  trail[idx].active = true;
+  trail[idx].x = x;
+  trail[idx].y = y;
+  trail[idx].bornMs = millis();
+  trail[idx].inCone = inCone;
+  slotTrailIdx[s] = (int8_t)idx;
+}
+
+// Repaint all trail dots at their current fade level. Expired dots
+// are blacked out and freed. Painted oldest first so fresh dots sit
+// on top where trails overlap.
+static void trailPaint() {
+  uint32_t now = millis();
+
+  int order[TRAIL_MAX];
+  int n = 0;
+  for (int i = 0; i < TRAIL_MAX; i++) {
+    if (!trail[i].active) continue;
+    int j = n++;
+    while (j > 0 && trail[order[j - 1]].bornMs > trail[i].bornMs) {
+      order[j] = order[j - 1];
+      j--;
+    }
+    order[j] = i;
+  }
+
+  for (int k = 0; k < n; k++) {
+    TrailDot& d = trail[order[k]];
+    uint32_t age = now - d.bornMs;
+    if (age >= TRAIL_FADE_MS) {
+      tft.fillCircle(d.x, d.y, DOT_RADIUS, UI_BG);
+      d.active = false;
+      continue;
+    }
+    uint16_t base = d.inCone ? COLOR_DOT_IN : COLOR_DOT_OUT;
+    uint16_t c = dimColor(base, TRAIL_FADE_MS - age, TRAIL_FADE_MS);
+    tft.fillCircle(d.x, d.y, DOT_RADIUS, c);
+  }
+}
+
+static void drawIdleCone() {
+  // tan(20 deg) = 0.36397; horizontal reach at full span
+  int16_t dx = (int16_t)(0.36397f * PLOT_SPAN_PX);  // ~80 px
+  tft.drawLine(PLOT_ORIGIN_X, PLOT_ORIGIN_Y, PLOT_ORIGIN_X - dx, PLOT_TOP_Y, COLOR_CONE);
+  tft.drawLine(PLOT_ORIGIN_X, PLOT_ORIGIN_Y, PLOT_ORIGIN_X + dx, PLOT_TOP_Y, COLOR_CONE);
+}
+
+// Map target slot i to screen. Same mm-per-pixel on both axes so the
+// plot keeps true aspect. Returns false if it cannot be plotted.
+// Takes the slot index, not the struct, so the Arduino-generated
+// prototype does not reference RD03DTarget before its definition.
+static bool plotPos(int i, int16_t* px, int16_t* py) {
+  const RD03DTarget& t = rd.target(i);
+  if (!t.valid || t.y_mm <= 0) return false;
+  if (t.y_mm > (int32_t)PLOT_RANGE_MM) return false;
+
+  int32_t x = PLOT_ORIGIN_X + ((int32_t)t.x_mm * PLOT_SPAN_PX) / (int32_t)PLOT_RANGE_MM;
+  int32_t y = PLOT_ORIGIN_Y - ((int32_t)t.y_mm * PLOT_SPAN_PX) / (int32_t)PLOT_RANGE_MM;
+
+  if (x < DOT_RADIUS || x > SCR_W - 1 - DOT_RADIUS) return false;
+  if (y < PLOT_TOP_Y || y > PLOT_ORIGIN_Y) return false;
+
+  *px = (int16_t)x;
+  *py = (int16_t)y;
+  return true;
+}
+
+static void drawIdleStatus() {
+  uint32_t lastFrame = rd.getLastFrameMs();
+  char buf[28];
+  uint16_t color;
+
+  if (lastFrame == 0) {
+    color = TFT_RED;
+    snprintf(buf, sizeof(buf), "RD03D: NO DATA");
+  } else {
+    uint32_t age = millis() - lastFrame;
+    if (age >= FRAME_TIMEOUT_MS) {
+      color = TFT_RED;
+      snprintf(buf, sizeof(buf), "RD03D LOST %lums", (unsigned long)age);
+    } else {
+      color = COLOR_STATUS;
+      snprintf(buf, sizeof(buf), "RD03D %lums", (unsigned long)age);
+    }
+  }
+
+  tft.setTextDatum(BL_DATUM);
+  tft.setTextColor(color, UI_BG);
+  tft.setTextPadding(150);  // clears leftover characters when text shortens
+  tft.drawString(buf, 2, SCR_H - 1, 1);
+  tft.setTextPadding(0);
+}
+
+// Full redraw on entering the idle view
+static void drawIdleStatic() {
+  tft.fillScreen(UI_BG);
+  trailReset();
+  drawIdleCone();
+  drawIdleStatus();
+}
+
+// Incremental update while the idle view is showing
+static void updateIdleView() {
+  static uint32_t lastPlotMs = 0;
+  static uint32_t lastStatusMs = 0;
+
+  if (millis() - lastPlotMs >= PLOT_UPDATE_MS) {
+    lastPlotMs = millis();
+
+    // Register current targets as fresh trail dots
+    for (int i = 0; i < 3; i++) {
+      int16_t x, y;
+      if (!plotPos(i, &x, &y)) continue;
+      trailAdd(i, x, y, targetInNarrowField(rd.target(i)));
+    }
+
+    // Repaint every dot at its fade level; expired dots black out
+    trailPaint();
+
+    // Restore cone lines where fading or expiring dots crossed them
+    drawIdleCone();
+  }
+
+  if (millis() - lastStatusMs >= STATUS_UPDATE_MS) {
+    lastStatusMs = millis();
+    drawIdleStatus();
   }
 }
 
